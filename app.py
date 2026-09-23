@@ -12,7 +12,7 @@ app = Flask(__name__)
 
 LEVERAGE = 125
 TARGET_LOTS = 20
-HARD_SL_PCT = -40.0  # Hard stop-loss limit (exits immediately if loss hits 40%)
+HARD_SL_PCT = -40.0  # Hard stop-loss limit
 
 bot_started = False
 is_position_active = False
@@ -291,12 +291,10 @@ def option_bot_loop():
         print(f"Fatal Option Bot Error: {e}", flush=True)
         update_dashboard(f"Error: {str(e)}", 0, False)
 
-@app.before_request
-def start_bot_once():
-    global bot_started
-    if not bot_started:
-        bot_started = True
-        threading.Thread(target=option_bot_loop, daemon=True).start()
+# App start hote hi thread auto-start hoga (bina kisi web request par depend hue)
+if not bot_started:
+    bot_started = True
+    threading.Thread(target=option_bot_loop, daemon=True).start()
 
 @app.route('/')
 def home():
