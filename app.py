@@ -74,11 +74,10 @@ def get_vwap_for_symbol(exchange, symbol):
         return None, None
 
 def find_strict_first_otm_option(exchange):
+    btc_price = 0
     try:
         markets = exchange.load_markets()
         
-        # Try fetching BTC price using alternative standard Delta symbols
-        btc_price = 0
         for test_sym in ['BTC/USDT:USDT', 'BTC/USD:BTC', 'BTCUSD', 'BTC/USDT']:
             try:
                 ticker = exchange.fetch_ticker(test_sym)
@@ -125,13 +124,13 @@ def find_strict_first_otm_option(exchange):
             if close_p and vwap_p:
                 if close_p < vwap_p:
                     print(f"✅ Found 1st OTM Option -> Symbol: {symbol} | Strike: {strike} | Premium: {close_p} < VWAP: {vwap_p:.2f}", flush=True)
-                    return symbol, close_p, btc_p
+                    return symbol, close_p, btc_price
                     
         print("⚠️ No 1st OTM option found with premium below VWAP right now.", flush=True)
-        return None, None, btc_p
+        return None, None, btc_price
     except Exception as e:
         print(f"Strict 1st OTM Scan Error: {e}", flush=True)
-        return None, None, 0
+        return None, None, btc_price
 
 def manage_option_position(exchange, symbol, entry_price):
     global is_position_active, expiry_day_shift
