@@ -17,7 +17,36 @@ is_position_active = False
 current_position_symbol = None
 expiry_day_shift = 0
 
+# Dashboard live metrics tracking
+dashboard_status = {
+    "status": "Initializing...",
+    "last_updated": "",
+    "live_btc_price": 0,
+    "position_active": False,
+    "active_symbol": None,
+    "entry_price": 0,
+    "current_price": 0,
+    "current_vwap": 0,
+    "pnl_percentage": 0,
+    "message": "Bot is starting up..."
+}
+
 ist = pytz.timezone('Asia/Kolkata')
+
+def update_dashboard(status_text, btc_p=0, pos_act=False, sym=None, entry_p=0, curr_p=0, vwap_p=0, pnl=0):
+    global dashboard_status
+    dashboard_status = {
+        "status": status_text,
+        "last_updated": datetime.now(ist).strftime('%Y-%m-%d %H:%M:%S IST'),
+        "live_btc_price": btc_p,
+        "position_active": pos_act,
+        "active_symbol": sym,
+        "entry_price": entry_p,
+        "current_price": curr_p,
+        "current_vwap": round(vwap_p, 2) if vwap_p else 0,
+        "pnl_percentage": round(pnl, 2),
+        "message": status_text
+    }
 
 def send_telegram_alert(message):
     token = os.getenv('TELEGRAM_TOKEN')
@@ -48,55 +77,63 @@ def get_vwap_for_symbol(exchange, symbol):
         print(f"Error calculating VWAP for {symbol}: {e}", flush=True)
         return None, None
 
-def find_best_dynamic_option_to_sell(exchange):
+def find_strict_first_otm_option(exchange):
     """
-    Dynamically fetches live BTC price, filters today's 0DTE options chain,
-    selects OTM contracts, and checks if their premium is below VWAP.
+    Finds the strictly 1st OTM option (immediate next strike above ATM for Call, 
+    or immediate next strike below ATM for Put) expiring today (0DTE), 
+    and checks if its premium is below VWAP.
     """
     try:
         markets = exchange.load_markets()
         
-        # Fetch current live BTC underlying price
+        # Fetch live BTC price
         ticker = exchange.fetch_ticker('BTC/USD:BTC')
         btc_price = ticker['last']
-        print(f"📊 Live BTC Reference Price for Option Selection: {btc_price}", flush=True)
+        print(f"📊 Live BTC Reference Price: {btc_price}", flush=True)
         
         # Filter BTC option symbols
         option_symbols = [symbol for symbol in markets if 'BTC' in symbol and ('C-' in symbol or 'P-' in symbol)]
         
-        # Let's find today's date string format used in Delta symbols (e.g., 24SEP26 or similar from market info)
-        # We look through available options to find the nearest/today's expiry (0DTE)
-        valid_options = []
+        calls = []
+        puts = []
+        
         for symbol in option_symbols:
             market = markets[symbol]
             strike = market.get('strike')
             option_type = market.get('optionType') # 'call' or 'put'
-            expiry_date_str = market.get('expiry') # timestamp or string depending on CCXT
             
             if not strike or not option_type:
                 continue
                 
-            # Dynamic OTM Filter: Call strike > btc_price (e.g., ~1% to 2% OTM), Put strike < btc_price
-            is_otm_call = (option_type == 'call' and strike > btc_price * 1.005)
-            is_otm_put = (option_type == 'put' and strike < btc_price * 0.995)
-            
-            if is_otm_call or is_otm_put:
-                valid_options.append((symbol, option_type, strike))
+            # Separate OTM Calls (strike > btc_price) and OTM Puts (strike < btc_price)
+            if option_type == 'call' and strike > btc_price:
+                calls.append((strike, symbol))
+            elif option_type == 'put' and strike < btc_price:
+                puts.append((strike, symbol))
                 
-        # Sort or iterate to check VWAP for potential OTM candidates
-        for symbol, option_type, strike in valid_options:
+        # Sort to find the STRICT 1st OTM (closest strike to current btc_price)
+        calls.sort(key=lambda x: x[0])  # Ascending (lowest strike above btc_price is 1st OTM Call)
+        puts.sort(key=lambda x: x[0], reverse=True)  # Descending (highest strike below btc_price is 1st OTM Put)
+        
+        candidates = []
+        if calls:
+            candidates.append(calls[0]) # 1st OTM Call
+        if puts:
+            candidates.append(puts[0]) # 1st OTM Put
+            
+        for strike, symbol in candidates:
             close_p, vwap_p = get_vwap_for_symbol(exchange, symbol)
             if close_p and vwap_p:
-                # Check condition: Premium (close price) < VWAP
+                # Check condition: Premium < VWAP
                 if close_p < vwap_p:
-                    print(f"✅ Selected Dynamic OTM {option_type.upper()} -> Symbol: {symbol} | Strike: {strike} | Premium: {close_p} < VWAP: {vwap_p:.2f}", flush=True)
-                    return symbol, close_p
+                    print(f"✅ Found 1st OTM Option -> Symbol: {symbol} | Strike: {strike} | Premium: {close_p} < VWAP: {vwap_p:.2f}", flush=True)
+                    return symbol, close_p, btc_p
                     
-        print("⚠️ No OTM option found with premium below VWAP right now.", flush=True)
-        return None, None
+        print("⚠️ No 1st OTM option found with premium below VWAP right now.", flush=True)
+        return None, None, btc_p
     except Exception as e:
-        print(f"Dynamic Option Chain Scan Error: {e}", flush=True)
-        return None, None
+        print(f"Strict 1st OTM Scan Error: {e}", flush=True)
+        return None, None, 0
 
 def manage_option_position(exchange, symbol, entry_price):
     """
@@ -105,12 +142,16 @@ def manage_option_position(exchange, symbol, entry_price):
     - Full exit if 15m candle closes above VWAP
     """
     global is_position_active, expiry_day_shift
-    print(f"🛡️ Managing Dynamic Option Position for {symbol} | Entry Premium: {entry_price}", flush=True)
+    print(f"🛡️ Managing 1st OTM Option Position for {symbol} | Entry Premium: {entry_price}", flush=True)
     
     while is_position_active:
         try:
             current_p, vwap_p = get_vwap_for_symbol(exchange, symbol)
+            ticker = exchange.fetch_ticker('BTC/USD:BTC')
+            btc_p = ticker['last'] if ticker else 0
+            
             if not current_p or not vwap_p:
+                update_dashboard("Monitoring Position (Fetching data error)", btc_p, True, symbol, entry_price, 0, 0, 0)
                 time.sleep(15)
                 continue
                 
@@ -118,15 +159,17 @@ def manage_option_position(exchange, symbol, entry_price):
             profit_pct = ((entry_price - current_p) / entry_price) * 100 * LEVERAGE
             
             print(f"📊 Live Monitor [{symbol}] -> Premium: {current_p} | VWAP: {vwap_p:.2f} | PnL: {profit_pct:.2f}%", flush=True)
+            update_dashboard("Position Active & Monitored", btc_p, True, symbol, entry_price, current_p, vwap_p, profit_pct)
             
             # Exit Condition 1: 90% Profit Reached (Full Exit)
             if profit_pct >= 90:
                 print(f"🎯 90% Profit Reached! Buying back {TARGET_LOTS} lots to close position...", flush=True)
                 exchange.create_order(symbol, 'market', 'buy', TARGET_LOTS)
-                send_telegram_alert(f"✅ *Target Hit (90% Profit)!*\nClosed dynamic option position on {symbol} at premium {current_p}")
+                send_telegram_alert(f"✅ *Target Hit (90% Profit)!*\nClosed option position on {symbol} at premium {current_p}")
                 
                 is_position_active = False
                 expiry_day_shift += 1
+                update_dashboard("Position Closed (90% Target Hit)", btc_p, False, None, 0, current_p, vwap_p, profit_pct)
                 break
                 
             # Exit Condition 2: Candle closes above VWAP
@@ -137,6 +180,7 @@ def manage_option_position(exchange, symbol, entry_price):
                 
                 is_position_active = False
                 expiry_day_shift += 1
+                update_dashboard("Position Closed (VWAP Crossed)", btc_p, False, None, 0, current_p, vwap_p, profit_pct)
                 break
                 
             time.sleep(15)
@@ -146,7 +190,7 @@ def manage_option_position(exchange, symbol, entry_price):
 
 def option_bot_loop():
     global is_position_active, current_position_symbol
-    print("🤖 BTC Dynamic 0DTE Option Selling Bot Initialized...", flush=True)
+    print("🤖 BTC Strict 1st OTM Option Selling Bot Initialized...", flush=True)
     time.sleep(5)
     
     try:
@@ -176,6 +220,12 @@ def option_bot_loop():
             now = datetime.now(ist)
             t = now.time()
             
+            try:
+                ticker = exchange.fetch_ticker('BTC/USD:BTC')
+                current_btc = ticker['last'] if ticker else 0
+            except:
+                current_btc = 0
+
             # 1. Square-off at 4:44 PM IST
             if t.hour == 16 and t.minute == 44:
                 if is_position_active and current_position_symbol:
@@ -187,20 +237,23 @@ def option_bot_loop():
                         print(f"Square-off error: {sq_err}", flush=True)
                     is_position_active = False
                     current_position_symbol = None
+                update_dashboard("Square-off Time (4:44 PM) - No Trade", current_btc, False)
                 time.sleep(60)
                 continue
                 
             # 2. No-Trade Zone: 4:45 PM to 6:29 PM IST
             if dtime(16, 45) <= t < dtime(18, 30):
                 print("⏳ No-Trade Zone active (4:45 PM - 6:29 PM). Sleeping...", flush=True)
+                update_dashboard("No-Trade Zone (4:45 PM - 6:29 PM)", current_btc, False)
                 time.sleep(60)
                 continue
                 
             # 3. Entry at exactly 6:30 PM IST (if no position is active)
             if not is_position_active and t.hour == 18 and t.minute >= 30:
-                print("🔍 6:30 PM reached. Dynamically scanning live OTM options chain...", flush=True)
+                print("🔍 6:30 PM reached. Scanning Strict 1st OTM options chain...", flush=True)
+                update_dashboard("Scanning Strict 1st OTM Options at 6:30 PM", current_btc, False)
                 
-                symbol, entry_price = find_best_dynamic_option_to_sell(exchange)
+                symbol, entry_price, btc_p = find_strict_first_otm_option(exchange)
                 if symbol and entry_price:
                     print(f"🚀 Placing Sell Order for {TARGET_LOTS} lots of {symbol} at 125x leverage...", flush=True)
                     response = exchange.create_order(symbol, 'market', 'sell', TARGET_LOTS)
@@ -208,17 +261,23 @@ def option_bot_loop():
                     is_position_active = True
                     current_position_symbol = symbol
                     
-                    send_telegram_alert(f"🚨 *Dynamic 0DTE Option Sell Executed!*\nSymbol: {symbol}\nLots: {TARGET_LOTS}\nLeverage: {LEVERAGE}x\nEntry Premium: {entry_price}")
+                    send_telegram_alert(f"🚨 *Strict 1st OTM Option Sell Executed!*\nSymbol: {symbol}\nLots: {TARGET_LOTS}\nLeverage: {LEVERAGE}x\nEntry Premium: {entry_price}")
+                    update_dashboard("Trade Executed Successfully", btc_p, True, symbol, entry_price, entry_price, 0, 0)
                     
                     # Start monitoring thread
                     threading.Thread(target=manage_option_position, args=(exchange, symbol, entry_price), daemon=True).start()
                 else:
-                    print("⏳ No suitable dynamic OTM option found below VWAP right now. Retrying in 60s...", flush=True)
+                    print("⏳ No suitable 1st OTM option found below VWAP right now. Retrying in 60s...", flush=True)
+                    update_dashboard("Waiting for VWAP condition on 1st OTM", current_btc, False)
+            else:
+                if not is_position_active:
+                    update_dashboard("Waiting for 6:30 PM IST Entry Window", current_btc, False)
                     
-            time.sleep(30)
+            time.sleep(60)
             
     except Exception as e:
         print(f"Fatal Option Bot Error: {e}", flush=True)
+        update_dashboard(f"Error: {str(e)}", 0, False)
 
 @app.before_request
 def start_bot_once():
@@ -229,13 +288,7 @@ def start_bot_once():
 
 @app.route('/')
 def home():
-    return jsonify({
-        "status": "BTC Dynamic 0DTE Option Selling Bot Running",
-        "position_active": is_position_active,
-        "active_symbol": current_position_symbol,
-        "leverage": LEVERAGE,
-        "lots": TARGET_LOTS
-    })
+    return jsonify(dashboard_status)
 
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=10000)
