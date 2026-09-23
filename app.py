@@ -76,8 +76,22 @@ def get_vwap_for_symbol(exchange, symbol):
 def find_strict_first_otm_option(exchange):
     try:
         markets = exchange.load_markets()
-        ticker = exchange.fetch_ticker('BTC/USD:BTC')
-        btc_price = ticker['last']
+        
+        # Try fetching BTC price using alternative standard Delta symbols
+        btc_price = 0
+        for test_sym in ['BTC/USDT:USDT', 'BTC/USD:BTC', 'BTCUSD', 'BTC/USDT']:
+            try:
+                ticker = exchange.fetch_ticker(test_sym)
+                if ticker and 'last' in ticker and ticker['last']:
+                    btc_price = ticker['last']
+                    break
+            except:
+                continue
+                
+        if not btc_price:
+            print("❌ Could not fetch live BTC reference price from any symbol.", flush=True)
+            return None, None, 0
+            
         print(f"📊 Live BTC Reference Price: {btc_price}", flush=True)
         
         option_symbols = [symbol for symbol in markets if 'BTC' in symbol and ('C-' in symbol or 'P-' in symbol)]
@@ -126,8 +140,16 @@ def manage_option_position(exchange, symbol, entry_price):
     while is_position_active:
         try:
             current_p, vwap_p = get_vwap_for_symbol(exchange, symbol)
-            ticker = exchange.fetch_ticker('BTC/USD:BTC')
-            btc_p = ticker['last'] if ticker else 0
+            
+            btc_p = 0
+            for test_sym in ['BTC/USDT:USDT', 'BTC/USD:BTC', 'BTCUSD', 'BTC/USDT']:
+                try:
+                    ticker = exchange.fetch_ticker(test_sym)
+                    if ticker and 'last' in ticker:
+                        btc_p = ticker['last']
+                        break
+                except:
+                    continue
             
             if not current_p or not vwap_p:
                 update_dashboard("Monitoring Position (Data error)", btc_p, True, symbol, entry_price, 0, 0, 0)
@@ -207,11 +229,15 @@ def option_bot_loop():
             now = datetime.now(ist)
             t = now.time()
             
-            try:
-                ticker = exchange.fetch_ticker('BTC/USD:BTC')
-                current_btc = ticker['last'] if ticker else 0
-            except:
-                current_btc = 0
+            current_btc = 0
+            for test_sym in ['BTC/USDT:USDT', 'BTC/USD:BTC', 'BTCUSD', 'BTC/USDT']:
+                try:
+                    ticker = exchange.fetch_ticker(test_sym)
+                    if ticker and 'last' in ticker:
+                        current_btc = ticker['last']
+                        break
+                except:
+                    continue
 
             # 1. Square-off at 4:44 PM IST
             if t.hour == 16 and t.minute == 44:
