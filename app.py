@@ -12,6 +12,8 @@ app = Flask(__name__)
 
 LEVERAGE = 125
 TARGET_LOTS = 20
+HARD_SL_PCT = -40.0  # Hard stop-loss limit (exits immediately if loss hits 40%)
+
 bot_started = False
 is_position_active = False
 current_position_symbol = None
@@ -60,16 +62,10 @@ def send_telegram_alert(message):
             print(f"Telegram Error: {e}", flush=True)
 
 def get_vwap_for_symbol(exchange, symbol):
-    """
-    Fetches 15m candles for the specific option symbol and calculates VWAP.
-    """
     try:
         ohlcv = exchange.fetch_ohlcv(symbol, timeframe='15m', limit=50)
         df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
-        
-        # VWAP calculation
         df['vwap'] = (df['volume'] * (df['high'] + df['low'] / 2)).cumsum() / df['volume'].cumsum()
-        
         current_close = df['close'].iloc[-1]
         current_vwap = df['vwap'].iloc[-1]
         return current_close, current_vwap
@@ -78,53 +74,41 @@ def get_vwap_for_symbol(exchange, symbol):
         return None, None
 
 def find_strict_first_otm_option(exchange):
-    """
-    Finds the strictly 1st OTM option (immediate next strike above ATM for Call, 
-    or immediate next strike below ATM for Put) expiring today (0DTE), 
-    and checks if its premium is below VWAP.
-    """
     try:
         markets = exchange.load_markets()
-        
-        # Fetch live BTC price
         ticker = exchange.fetch_ticker('BTC/USD:BTC')
         btc_price = ticker['last']
         print(f"📊 Live BTC Reference Price: {btc_price}", flush=True)
         
-        # Filter BTC option symbols
         option_symbols = [symbol for symbol in markets if 'BTC' in symbol and ('C-' in symbol or 'P-' in symbol)]
-        
         calls = []
         puts = []
         
         for symbol in option_symbols:
             market = markets[symbol]
             strike = market.get('strike')
-            option_type = market.get('optionType') # 'call' or 'put'
+            option_type = market.get('optionType')
             
             if not strike or not option_type:
                 continue
                 
-            # Separate OTM Calls (strike > btc_price) and OTM Puts (strike < btc_price)
             if option_type == 'call' and strike > btc_price:
                 calls.append((strike, symbol))
             elif option_type == 'put' and strike < btc_price:
                 puts.append((strike, symbol))
                 
-        # Sort to find the STRICT 1st OTM (closest strike to current btc_price)
-        calls.sort(key=lambda x: x[0])  # Ascending (lowest strike above btc_price is 1st OTM Call)
-        puts.sort(key=lambda x: x[0], reverse=True)  # Descending (highest strike below btc_price is 1st OTM Put)
+        calls.sort(key=lambda x: x[0])
+        puts.sort(key=lambda x: x[0], reverse=True)
         
         candidates = []
         if calls:
-            candidates.append(calls[0]) # 1st OTM Call
+            candidates.append(calls[0])
         if puts:
-            candidates.append(puts[0]) # 1st OTM Put
+            candidates.append(puts[0])
             
         for strike, symbol in candidates:
             close_p, vwap_p = get_vwap_for_symbol(exchange, symbol)
             if close_p and vwap_p:
-                # Check condition: Premium < VWAP
                 if close_p < vwap_p:
                     print(f"✅ Found 1st OTM Option -> Symbol: {symbol} | Strike: {strike} | Premium: {close_p} < VWAP: {vwap_p:.2f}", flush=True)
                     return symbol, close_p, btc_p
@@ -136,11 +120,6 @@ def find_strict_first_otm_option(exchange):
         return None, None, 0
 
 def manage_option_position(exchange, symbol, entry_price):
-    """
-    Monitors active option position:
-    - Full exit if 90% profit reached
-    - Full exit if 15m candle closes above VWAP
-    """
     global is_position_active, expiry_day_shift
     print(f"🛡️ Managing 1st OTM Option Position for {symbol} | Entry Premium: {entry_price}", flush=True)
     
@@ -151,11 +130,11 @@ def manage_option_position(exchange, symbol, entry_price):
             btc_p = ticker['last'] if ticker else 0
             
             if not current_p or not vwap_p:
-                update_dashboard("Monitoring Position (Fetching data error)", btc_p, True, symbol, entry_price, 0, 0, 0)
+                update_dashboard("Monitoring Position (Data error)", btc_p, True, symbol, entry_price, 0, 0, 0)
                 time.sleep(15)
                 continue
                 
-            # Short option profit percentage = ((Entry Price - Current Price) / Entry Price) * 100 * Leverage
+            # Short option profit/loss percentage calculation
             profit_pct = ((entry_price - current_p) / entry_price) * 100 * LEVERAGE
             
             print(f"📊 Live Monitor [{symbol}] -> Premium: {current_p} | VWAP: {vwap_p:.2f} | PnL: {profit_pct:.2f}%", flush=True)
@@ -163,21 +142,29 @@ def manage_option_position(exchange, symbol, entry_price):
             
             # Exit Condition 1: 90% Profit Reached (Full Exit)
             if profit_pct >= 90:
-                print(f"🎯 90% Profit Reached! Buying back {TARGET_LOTS} lots to close position...", flush=True)
+                print(f"🎯 90% Profit Reached! Closing position...", flush=True)
                 exchange.create_order(symbol, 'market', 'buy', TARGET_LOTS)
-                send_telegram_alert(f"✅ *Target Hit (90% Profit)!*\nClosed option position on {symbol} at premium {current_p}")
-                
+                send_telegram_alert(f"✅ *Target Hit (90% Profit)!*\nClosed position on {symbol} at premium {current_p}")
                 is_position_active = False
                 expiry_day_shift += 1
                 update_dashboard("Position Closed (90% Target Hit)", btc_p, False, None, 0, current_p, vwap_p, profit_pct)
                 break
                 
-            # Exit Condition 2: Candle closes above VWAP
+            # Exit Condition 2: Hard Stop-Loss Triggered (-40%)
+            if profit_pct <= HARD_SL_PCT:
+                print(f"🛑 Hard Stop-Loss Hit ({profit_pct:.2f}%)! Exiting position immediately...", flush=True)
+                exchange.create_order(symbol, 'market', 'buy', TARGET_LOTS)
+                send_telegram_alert(f"🛑 *Hard Stop-Loss Triggered!*\nClosed position on {symbol} at premium {current_p} due to loss limit ({profit_pct:.2f}%).")
+                is_position_active = False
+                expiry_day_shift += 1
+                update_dashboard("Position Closed (Hard Stop-Loss Hit)", btc_p, False, None, 0, current_p, vwap_p, profit_pct)
+                break
+
+            # Exit Condition 3: Candle closes above VWAP
             if current_p > vwap_p:
                 print(f"⚠️ Candle closed above VWAP! Exiting option position...", flush=True)
                 exchange.create_order(symbol, 'market', 'buy', TARGET_LOTS)
                 send_telegram_alert(f"⚠️ *VWAP Exit Triggered!*\nClosed position on {symbol} as premium crossed above VWAP.")
-                
                 is_position_active = False
                 expiry_day_shift += 1
                 update_dashboard("Position Closed (VWAP Crossed)", btc_p, False, None, 0, current_p, vwap_p, profit_pct)
@@ -237,7 +224,7 @@ def option_bot_loop():
                         print(f"Square-off error: {sq_err}", flush=True)
                     is_position_active = False
                     current_position_symbol = None
-                update_dashboard("Square-off Time (4:44 PM) - No Trade", current_btc, False)
+                update_dashboard("Square-off Time (4:44 PM)", current_btc, False)
                 time.sleep(60)
                 continue
                 
@@ -248,27 +235,27 @@ def option_bot_loop():
                 time.sleep(60)
                 continue
                 
-            # 3. Entry at exactly 6:30 PM IST (if no position is active)
-            if not is_position_active and t.hour == 18 and t.minute >= 30:
-                print("🔍 6:30 PM reached. Scanning Strict 1st OTM options chain...", flush=True)
-                update_dashboard("Scanning Strict 1st OTM Options at 6:30 PM", current_btc, False)
-                
-                symbol, entry_price, btc_p = find_strict_first_otm_option(exchange)
-                if symbol and entry_price:
-                    print(f"🚀 Placing Sell Order for {TARGET_LOTS} lots of {symbol} at 125x leverage...", flush=True)
-                    response = exchange.create_order(symbol, 'market', 'sell', TARGET_LOTS)
+            # 3. Entry Window starting from 6:30 PM IST onwards
+            if not is_position_active and (t.hour > 18 or (t.hour == 18 and t.minute >= 30)):
+                if t.hour < 23:
+                    print("🔍 Scanning Strict 1st OTM options chain...", flush=True)
+                    update_dashboard("Scanning Strict 1st OTM Options", current_btc, False)
                     
-                    is_position_active = True
-                    current_position_symbol = symbol
-                    
-                    send_telegram_alert(f"🚨 *Strict 1st OTM Option Sell Executed!*\nSymbol: {symbol}\nLots: {TARGET_LOTS}\nLeverage: {LEVERAGE}x\nEntry Premium: {entry_price}")
-                    update_dashboard("Trade Executed Successfully", btc_p, True, symbol, entry_price, entry_price, 0, 0)
-                    
-                    # Start monitoring thread
-                    threading.Thread(target=manage_option_position, args=(exchange, symbol, entry_price), daemon=True).start()
-                else:
-                    print("⏳ No suitable 1st OTM option found below VWAP right now. Retrying in 60s...", flush=True)
-                    update_dashboard("Waiting for VWAP condition on 1st OTM", current_btc, False)
+                    symbol, entry_price, btc_p = find_strict_first_otm_option(exchange)
+                    if symbol and entry_price:
+                        print(f"🚀 Placing Sell Order for {TARGET_LOTS} lots of {symbol} at 125x leverage...", flush=True)
+                        response = exchange.create_order(symbol, 'market', 'sell', TARGET_LOTS)
+                        
+                        is_position_active = True
+                        current_position_symbol = symbol
+                        
+                        send_telegram_alert(f"🚨 *Strict 1st OTM Option Sell Executed!*\nSymbol: {symbol}\nLots: {TARGET_LOTS}\nLeverage: {LEVERAGE}x\nEntry Premium: {entry_price}")
+                        update_dashboard("Trade Executed Successfully", btc_p, True, symbol, entry_price, entry_price, 0, 0)
+                        
+                        threading.Thread(target=manage_option_position, args=(exchange, symbol, entry_price), daemon=True).start()
+                    else:
+                        print("⏳ No suitable 1st OTM option found below VWAP. Retrying in 60s...", flush=True)
+                        update_dashboard("Waiting for VWAP condition on 1st OTM", current_btc, False)
             else:
                 if not is_position_active:
                     update_dashboard("Waiting for 6:30 PM IST Entry Window", current_btc, False)
